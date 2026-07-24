@@ -68,7 +68,7 @@ config :spark,
 config :personal_finance_tracker,
   ecto_repos: [PersonalFinanceTracker.Repo],
   generators: [timestamp_type: :utc_datetime],
-  ash_domains: []
+  ash_domains: [PersonalFinanceTracker.Expenses]
 
 # Configure the endpoint
 config :personal_finance_tracker, PersonalFinanceTrackerWeb.Endpoint,
