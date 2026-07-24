@@ -19,8 +19,7 @@ defmodule PersonalFinanceTrackerWeb.Router do
   scope "/", PersonalFinanceTrackerWeb do
     pipe_through :browser
 
-    # EXAMPLE route — repoint this at your own LiveView and delete ExampleLive + ExampleForm.vue.
-    live "/", ExampleLive
+    live "/", ExpenseLive
   end
 
   # Other scopes may use custom stacks.
