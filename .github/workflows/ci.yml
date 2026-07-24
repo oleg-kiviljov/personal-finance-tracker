@@ -1,0 +1,258 @@
+name: CI
+
+# PUSH-ONLY, deliberately. Runs on main, on the agent build branches (so Invoker's verify_ci
+# finds the "Build and test" check-run on the build commit), and on the `iteration/**` integration
+# branches (so the iteration→main PR's required "Build and test" check is satisfied by a push run on
+# the branch HEAD SHA — GitHub matches required checks on SHA+context, not event). There is NO
+# `pull_request:` trigger.
+#
+# Why: feature builds ALREADY open PRs feature/<id> → main (verify_ci opens the PR on the first verify
+# tick), so with both triggers every build branch fired a `push` AND a `pull_request` run on the same
+# head SHA — a duplicate suite, and a `skipped` twin of every check-run that had to be filtered
+# downstream. A push-event check on the head SHA satisfies the PR's required status check on its own,
+# because GitHub matches required checks on **SHA + context, not on the triggering event**.
+#
+# COUPLING (do not split these apart):
+#   1. `preview-image` is gated on `github.event_name == 'push'` AND a `feature/` ref prefix, so an
+#      `iteration/**` push builds NO preview image (correct — the iteration branch itself is not a
+#      previewable feature; the polish feature on its own `feature/<polish-id>` branch IS). Drop
+#      `feature/**` from `push:` and preview images silently stop being built.
+#   2. `builder-image` / `release-image` are gated on `push` to `main`. Same dependency.
+#   3. Re-adding `pull_request:` reintroduces the duplicate suite. If you ever need it (e.g. to CI
+#      contributions from forks, which push-only cannot reach), you must also re-add a job-level
+#      `if` on `build` skipping the PR-event run for feature/** heads, or every build gets two
+#      identical suites again.
+#
+# Trade-off accepted: a fork PR gets no CI at all, so its required "Build and test" check never
+# reports and the PR is unmergeable. That fails SAFE (never silently ungated), and these repos are
+# single-user — no outside contributions expected.
+on:
+  push:
+    branches: [main, "feature/**", "iteration/**"]
+
+# Cancel superseded in-progress runs for the same ref (rapid pushes don't pile up).
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# Default-deny at the workflow level: the `build` job needs only to read the checkout. Image jobs
+# re-grant themselves `packages: write` per-job (a per-job `permissions:` block fully replaces this).
+permissions:
+  contents: read
+
+env:
+  MIX_ENV: test
+
+jobs:
+  build:
+    name: Build and test
+    runs-on: ubuntu-latest
+
+    services:
+      db:
+        image: postgres:18
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_USER: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      # Toolchain single-sourced from .tool-versions (same file mise reads locally and the Dockerfile
+      # ARGs track) — no hardcoded elixir/otp version to drift. `strict` = install exactly what the
+      # file names (28.5 / 1.20.2-otp-28), never a floating range.
+      - name: Set up Elixir
+        uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24.1
+        with:
+          version-file: .tool-versions
+          version-type: strict
+
+      - name: Set up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .tool-versions
+
+      # Key on the toolchain too — a beam-version bump (via .tool-versions) must bust the cache, or
+      # stale _build artifacts compiled with the old OTP/Elixir get restored and fail in confusing
+      # ways. restore-keys keeps the SAME toolchain hash: a prefix-only fallback is exactly what
+      # restored an old-OTP _build into a new-OTP job (the bug this replaces).
+      - name: Cache deps and _build
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            deps
+            _build
+          key: ${{ runner.os }}-beam-${{ hashFiles('.tool-versions') }}-mix-${{ hashFiles('mix.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-beam-${{ hashFiles('.tool-versions') }}-mix-
+
+      # npm cache (~/.npm) — location-independent, so it works regardless of where phoenix_vite
+      # installs node_modules. assets.setup re-resolves fast on a hit.
+      - name: Cache npm
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-npm-${{ hashFiles('package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-npm-
+
+      - name: Install Elixir dependencies
+        run: mix deps.get
+
+      - name: Install npm dependencies (via phoenix_vite)
+        run: mix assets.setup
+
+      - name: Build assets (client + SSR)
+        run: mix assets.build
+
+      - name: Run precommit (compile, format, credo, sobelow, deps.audit, test)
+        run: mix precommit
+
+  # ─── Images (gated on the green "Build and test" job via `needs: build`) ────────────────────
+  # These jobs build the images for repos SCAFFOLDED FROM this template — they are skipped in the
+  # template repo itself, which has no app to ship. The guard is `!github.event.repository.is_template`
+  # (the repo's GitHub "template repository" setting) — NOT a repo-name comparison, because the
+  # scaffold rename rewrites the template's name into the app's name, turning a name-based guard into
+  # a dead condition. A scaffolded repo is not a template, so it runs the jobs.
+  #
+  # Only on push (a PR's images would double-build with the branch push). The PREVIEW image is built
+  # ONLY on `feature/**` branches: Invoker boots `:preview-<sha>` keyed to a feature build's branch
+  # commit, so a `main`-sha preview (and the floating `:preview` tag) is never consumed — building it
+  # on main, including the initial scaffold commit, is pure waste. The builder and release images are
+  # app-code-independent / prod artifacts → main only.
+  #
+  # arm64 is the msb host arch (Apple Silicon), so the builder + preview images are built for
+  # linux/arm64 on NATIVE arm64 runners (`ubuntu-24.04-arm`, paid larger runners — scaffolded repos
+  # are private so the free arm runners don't apply). Native arm64 means NO QEMU emulation for these
+  # jobs. The release image is amd64 and stays on the default amd64 runner.
+  #
+  # CACHING: every image build uses the REGISTRY cache backend (`type=registry`, `mode=max` — max
+  # also caches intermediate stages, incl. the shared `base`), each job on its OWN `:buildcache-*`
+  # ref. Two reasons this is registry and not `type=gha`:
+  #
+  #   1. GHA cache is BRANCH-SCOPED, and every feature build runs on a FRESH `feature/<uuid>` branch.
+  #      A cache written there is readable only from that branch, so the next feature build — a new
+  #      uuid — could never read it. Measured on a real build: preview-image took 4m10s with ZERO
+  #      `CACHED` steps (93s of it `mix deps.compile` alone), while a second push to the SAME build
+  #      branch took 1m22s. The layer ordering in the Dockerfile was always correct; the cache was
+  #      simply unreachable, and `cache-to` was uploading ~500MB per build that nothing would ever
+  #      read (which also evicts the useful main-branch entries once the repo passes the 10GB cap).
+  #      A registry ref has no branch scoping: every build branch reads and writes the same ref.
+  #
+  #   2. All three image jobs previously shared the DEFAULT gha scope (`buildkit`), so they
+  #      overwrote each other's cache index — and since `release` is amd64 while `builder`/`preview`
+  #      are arm64, whichever job wrote last left an index whose layers the others cannot match.
+  #      That is why builder-image showed zero `CACHED` even on main→main, a valid scope. Distinct
+  #      refs per job fix it; do NOT collapse them back onto one ref.
+  #
+  # Note: BuildKit `--mount=type=cache` mounts (apt/npm inside the Dockerfile) are NOT exported by
+  # any cache backend — that's expected; the reordered app-build layers (deps compiled on lockfiles)
+  # carry the real win. The `:buildcache-*` tags are ordinary GHCR packages living alongside the
+  # image tags — they are BuildKit cache manifests, not runnable images; never boot one.
+
+  preview-image:
+    name: Build & push preview image
+    needs: build
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/heads/feature/') && !github.event.repository.is_template
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+      - uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - id: tags
+        name: Compute tags
+        run: |
+          repo="$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')"
+          echo "repo=${repo}" >> "$GITHUB_OUTPUT"
+          echo "ref=ghcr.io/${repo}:preview-${{ github.sha }}" >> "$GITHUB_OUTPUT"
+      - uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          target: preview
+          platforms: linux/arm64
+          push: true
+          tags: ${{ steps.tags.outputs.ref }}
+          cache-from: type=registry,ref=ghcr.io/${{ steps.tags.outputs.repo }}:buildcache-preview
+          cache-to: type=registry,ref=ghcr.io/${{ steps.tags.outputs.repo }}:buildcache-preview,mode=max
+
+  builder-image:
+    name: Build & push builder image
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && !github.event.repository.is_template
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+      - uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - id: tags
+        name: Compute tags
+        run: |
+          repo="$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')"
+          echo "repo=${repo}" >> "$GITHUB_OUTPUT"
+          { echo "list<<EOF";
+            echo "ghcr.io/${repo}:builder";
+            echo "ghcr.io/${repo}:builder-${{ github.sha }}";
+            echo "EOF"; } >> "$GITHUB_OUTPUT"
+      - uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          target: builder
+          platforms: linux/arm64
+          push: true
+          tags: ${{ steps.tags.outputs.list }}
+          cache-from: type=registry,ref=ghcr.io/${{ steps.tags.outputs.repo }}:buildcache-builder
+          cache-to: type=registry,ref=ghcr.io/${{ steps.tags.outputs.repo }}:buildcache-builder,mode=max
+
+  release-image:
+    name: Build & push release image
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && !github.event.repository.is_template
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+      - uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - id: tags
+        name: Compute tags
+        run: |
+          repo="$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')"
+          echo "repo=${repo}" >> "$GITHUB_OUTPUT"
+          echo "ref=ghcr.io/${repo}:release" >> "$GITHUB_OUTPUT"
+      - uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          target: release
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.tags.outputs.ref }}
+          cache-from: type=registry,ref=ghcr.io/${{ steps.tags.outputs.repo }}:buildcache-release
+          cache-to: type=registry,ref=ghcr.io/${{ steps.tags.outputs.repo }}:buildcache-release,mode=max

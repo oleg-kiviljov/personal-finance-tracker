@@ -1,0 +1,16 @@
+version: 2
+updates:
+  # Keep the SHA-pinned actions in .github/workflows/ from rotting: Dependabot opens a weekly PR that
+  # bumps each pin to the newest release's commit SHA (and updates the trailing `# vX.Y.Z` comment),
+  # so pinning stays reviewable instead of freezing us on stale, potentially-vulnerable versions.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "ci"
+    groups:
+      # One grouped PR for the docker/* actions (they move together on release day).
+      docker-actions:
+        patterns:
+          - "docker/*"

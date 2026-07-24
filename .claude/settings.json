@@ -1,0 +1,12 @@
+{
+  "enabledPlugins": {
+    "elixir-phoenix@oliver-kriska": true,
+    "vue-best-practices@vue-skills": true,
+    "create-adaptable-composable@vue-skills": true,
+    "vue-debug-guides@vue-skills": true
+  },
+  "enabledMcpjsonServers": [
+    "nuxt-ui"
+  ],
+  "enableAllProjectMcpServers": true
+}

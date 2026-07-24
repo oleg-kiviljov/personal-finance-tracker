@@ -1,0 +1,25 @@
+# Build artifacts and deps — rebuilt inside the image.
+/_build/
+/deps/
+/cover/
+/doc/
+
+# Node modules — reinstalled via `mix assets.setup` inside the image.
+/assets/node_modules/
+/node_modules/
+
+# Compiled static assets — rebuilt via `mix assets.deploy` inside the image.
+/priv/static/assets/
+/priv/static/.vite/
+
+# VCS and editor noise.
+/.git/
+/.github/
+*.ez
+erl_crash.dump
+.elixir_ls/
+.DS_Store
+
+# Local secrets / env.
+/.env
+/.tool-versions

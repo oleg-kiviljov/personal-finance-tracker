@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "nuxt-ui": {
+      "type": "http",
+      "url": "https://ui.nuxt.com/mcp"
+    },
+    "tidewave": {
+      "type": "http",
+      "url": "http://localhost:4000/tidewave/mcp"
+    }
+  }
+}
