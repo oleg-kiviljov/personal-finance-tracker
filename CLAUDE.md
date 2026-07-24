@@ -55,6 +55,16 @@ access, prefer Ash actions via domain code interfaces over direct `Repo` calls.
 After changing any Ash resource, run `mix ash.codegen <name> && mix ash.migrate` (migrations are
 generated from snapshots — never hand-write them; never edit `priv/resource_snapshots/`).
 
+**Postgres extension types require declaring the extension FIRST.** If a resource uses a type
+backed by a Postgres extension — most commonly `:ci_string` (needs `citext`) — you MUST add the
+extension to the repo's `installed_extensions/0` (`lib/personal_finance_tracker/repo.ex`, e.g.
+`["ash-functions", "citext"]`) **before** running `mix ash.codegen`. Skipping this generates a
+table migration that references the missing type; it fails mid-run without a transaction, leaves
+partial tables, and recovery is painful because `mix ecto.drop`/`ecto.reset` are blocked by a
+safety hook. Order matters: the extension migration must be generated so it runs before the table
+migration. If you already ran a broken migration, don't bundle the fix `rm` in the same `&&` chain
+as a blocked `ecto.drop` — the block aborts the whole compound command and the `rm` never runs.
+
 ## Feature build contract — full-stack (governs `/phx:plan`, `/phx:work`, `/phx:full`)
 
 The stack is **Phoenix + Ash** (backend) and **LiveView + LiveVue + Vue + Nuxt UI** (frontend).
@@ -194,6 +204,11 @@ client-owned SPA; LiveVue does not. **When they disagree, LiveVue wins.** Full r
   `AshPhoenix.Form` has `data: nil`, which crashes the LiveVue form encoder during SSR — normalize
   with a `to_vue_form/1` helper (`%{to_form(form) | data: form.data || %{}}`), and re-wrap the
   results of `AshPhoenix.Form.validate/2` and `submit/2` with `to_form` every time.
+- **Ash scalar wrapper types crossing into a prop also need an `Encoder` impl.** Deriving the
+  encoder on the resource is not enough when a *field's value* is itself a struct — notably
+  `Ash.CiString` (from a `:ci_string` attribute), which has no `LiveVue.Encoder` and raises
+  `Protocol.UndefinedError` at render/SSR. Add a targeted impl once in the permanent
+  `live_vue_helpers.ex` (encode `Ash.CiString` as its underlying string), not per-feature.
 - **Components:** PascalCase `.vue` files in `assets/vue/`; `<script setup lang="ts">`.
 - **HEEx-component mandates don't apply inside Vue.** On a Vue-rendered surface, inputs come from
   `useLiveForm()`'s `inputAttrs`, icons are Nuxt UI `<UIcon name="i-lucide-…" />`. Those HEEx
