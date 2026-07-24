@@ -20,6 +20,13 @@ navigation; `references/layouts/` for page shells). Select components from there
 exact props/slots via the nuxt-ui MCP; if the MCP is unavailable, `references/components.md` is
 the offline fallback — do not guess.
 
+**Prop verification is expensive via `get-component-metadata`** — for rich components (Select,
+SelectMenu, InputNumber) it returns 85–220 KB and exceeds the tool-output token limit, forcing a
+persisted-file grep. Prefer the cheapest source that answers the question: `search-components` /
+`search-documentation` for a targeted lookup, or a `WebFetch` of the specific component's docs page
+for a props list. Reach for `get-component-metadata` only when you need the full prop surface, and
+expect to `Grep` the persisted output file rather than read it inline.
+
 ## Your job — produce a concise **Frontend** design
 
 1. **Component breakdown** — the `.vue` components to build (PascalCase), where each lives
